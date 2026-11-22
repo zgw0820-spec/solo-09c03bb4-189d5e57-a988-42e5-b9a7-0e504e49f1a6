@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>代理换版环境配置 Wasm 校验</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --line: #334155;
+    --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8;
+    --pass: #22c55e; --fail: #ef4444; --warn: #f59e0b; --skip: #a78bfa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 18px; margin-bottom: 18px;
+  }
+  .panel h2 { font-size: 16px; margin: 0 0 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  input[type=text], input[type=number] {
+    width: 100%; background: #0b1220; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; font-size: 13px;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  .budget-row { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 14px; }
+  .budget-row label { flex: 1 1 220px; font-size: 13px; color: var(--muted); }
+  .budget-row input { margin-top: 4px; }
+  button {
+    background: var(--accent); color: #082f49; border: 0; border-radius: 8px;
+    padding: 9px 18px; font-size: 14px; font-weight: 700; cursor: pointer;
+  }
+  button.secondary { background: #475569; color: var(--text); }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  .actions { margin-top: 14px; display: flex; gap: 10px; }
+  .badge {
+    display: inline-block; padding: 2px 9px; border-radius: 999px;
+    font-size: 12px; font-weight: 700; white-space: nowrap;
+  }
+  .b-queued { background: #475569; color: #fff; }
+  .b-running { background: var(--accent); color: #082f49; }
+  .b-passed { background: var(--pass); color: #052e16; }
+  .b-failed { background: var(--fail); color: #fff; }
+  .b-no_conclusion { background: var(--warn); color: #451a03; }
+  .b-skipped { background: var(--skip); color: #2e1065; }
+  .stat { display: flex; gap: 24px; flex-wrap: wrap; font-size: 13px; margin-bottom: 12px; }
+  .stat b { font-size: 15px; }
+  .muted { color: var(--muted); }
+  .err { color: var(--fail); font-size: 13px; min-height: 18px; margin-top: 8px; }
+  .verdict-cell { max-width: 360px; }
+  .del-btn { background: transparent; color: var(--fail); padding: 2px 8px; font-size: 12px; }
+  code { background: #0b1220; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>代理换版 · 环境连接上限 / 请求超时 Wasm 校验</h1>
+  <div class="sub">
+    Wasmtime 运行内置 Wasm 校验器（模块只编译一次，每项独立初始状态）；
+    最多并行 <b>2</b> 项，启动前预留足额单项指令额度，结束后按实际消耗结算、退回未用额度；
+    预算不足时剩余配置标记为“未检”。
+  </div>
+
+  <div class="panel">
+    <h2>① 提交多套环境配置</h2>
+    <table id="cfg-table">
+      <thead>
+        <tr>
+          <th style="width:200px">环境名称</th>
+          <th style="width:170px">连接上限（个）</th>
+          <th style="width:170px">请求超时（毫秒）</th>
+          <th style="width:70px"></th>
+        </tr>
+      </thead>
+      <tbody id="cfg-body"></tbody>
+    </table>
+    <div class="actions">
+      <button class="secondary" id="add-row" type="button">+ 增加一套</button>
+    </div>
+    <div class="budget-row">
+      <label>单项指令额度（fuel / 每项预留）
+        <input type="number" id="per-item-fuel" min="1" step="1" value="300000" />
+      </label>
+      <label>整批指令预算（fuel / 全局共享）
+        <input type="number" id="total-budget" min="1" step="1" value="1500000" />
+      </label>
+    </div>
+    <div class="actions">
+      <button id="submit" type="button">提交整批校验</button>
+      <span class="err" id="form-err"></span>
+    </div>
+  </div>
+
+  <div class="panel" id="result-panel" style="display:none">
+    <h2>② 校验进度与逐项结论</h2>
+    <div class="stat" id="batch-stat"></div>
+    <table>
+      <thead>
+        <tr>
+          <th>环境</th>
+          <th>连接上限</th>
+          <th>请求超时</th>
+          <th>状态</th>
+          <th class="verdict-cell">校验结论 / 未得出结论原因</th>
+          <th>预留额度</th>
+          <th>实际消耗</th>
+        </tr>
+      </thead>
+      <tbody id="result-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const STATUS_LABEL = {
+  queued: "排队中", running: "校验中", passed: "通过",
+  failed: "不通过", no_conclusion: "未得出结论", skipped: "未检"
+};
+let currentBatchId = null;
+let pollTimer = null;
+
+function addRow(name = "", conn = "", timeout = "") {
+  const tr = document.createElement("tr");
+  tr.innerHTML = `
+    <td><input type="text" class="c-name" placeholder="如 prod-cn-east" value="${name}"></td>
+    <td><input type="number" class="c-conn" min="0" value="${conn}"></td>
+    <td><input type="number" class="c-timeout" min="0" value="${timeout}"></td>
+    <td><button class="del-btn" type="button">删除</button></td>`;
+  tr.querySelector(".del-btn").onclick = () => tr.remove();
+  document.getElementById("cfg-body").appendChild(tr);
+}
+
+function readConfigs() {
+  const rows = [...document.querySelectorAll("#cfg-body tr")];
+  return rows.map(tr => ({
+    env_name: tr.querySelector(".c-name").value.trim(),
+    conn_limit: Number(tr.querySelector(".c-conn").value),
+    timeout_ms: Number(tr.querySelector(".c-timeout").value)
+  }));
+}
+
+function renderBatch(b) {
+  document.getElementById("result-panel").style.display = "block";
+  const counts = {};
+  b.items.forEach(i => { counts[i.status] = (counts[i.status] || 0) + 1; });
+  document.getElementById("batch-stat").innerHTML = `
+    <span>批次 <code>${b.id}</code></span>
+    <span>整批预算 <b>${b.total_budget.toLocaleString()}</b></span>
+    <span>剩余预算 <b>${b.remaining_budget.toLocaleString()}</b></span>
+    <span>在跑预留 <b>${b.reserved.toLocaleString()}</b></span>
+    <span>已结算消耗 <b>${b.settled_consumed.toLocaleString()}</b></span>
+    <span>并行上限 <b>${b.max_parallel}</b></span>
+    <span class="muted">排队 ${counts.queued || 0} · 校验中 ${counts.running || 0} ·
+      通过 ${counts.passed || 0} · 不通过 ${counts.failed || 0} ·
+      未结论 ${counts.no_conclusion || 0} · 未检 ${counts.skipped || 0}</span>`;
+
+  document.getElementById("result-body").innerHTML = b.items.map(i => `
+    <tr>
+      <td>${i.env_name}</td>
+      <td>${i.conn_limit.toLocaleString()}</td>
+      <td>${i.timeout_ms.toLocaleString()}</td>
+      <td><span class="badge b-${i.status}">${STATUS_LABEL[i.status]}</span></td>
+      <td class="verdict-cell">${i.verdict || '<span class="muted">—</span>'}
+        ${i.reason ? `<div class="muted" style="font-size:12px">原因：${i.reason}</div>` : ""}</td>
+      <td>${i.fuel_quota.toLocaleString()}</td>
+      <td>${i.status === "queued" || i.status === "running"
+        ? '<span class="muted">—</span>' : i.consumed.toLocaleString()}</td>
+    </tr>`).join("");
+}
+
+async function poll() {
+  if (!currentBatchId) return;
+  const r = await fetch(`/api/batches/${currentBatchId}`);
+  if (!r.ok) { stopPolling(); return; }
+  const b = await r.json();
+  renderBatch(b);
+  if (b.done) stopPolling();
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  const btn = document.getElementById("submit");
+  btn.disabled = false; btn.textContent = "提交整批校验";
+}
+
+document.getElementById("add-row").onclick = () => addRow();
+document.getElementById("submit").onclick = async () => {
+  const errEl = document.getElementById("form-err");
+  errEl.textContent = "";
+  const configs = readConfigs();
+  if (!configs.length) { errEl.textContent = "至少保留一套配置"; return; }
+  for (const c of configs) {
+    if (!c.env_name) { errEl.textContent = "环境名称不能为空"; return; }
+    if (!Number.isFinite(c.conn_limit) || c.conn_limit < 0
+      || !Number.isFinite(c.timeout_ms) || c.timeout_ms < 0) {
+      errEl.textContent = "连接上限与请求超时必须是非负整数"; return;
+    }
+  }
+  const perItemFuel = Number(document.getElementById("per-item-fuel").value);
+  const totalBudget = Number(document.getElementById("total-budget").value);
+  if (!(perItemFuel > 0) || !(totalBudget > 0)) {
+    errEl.textContent = "单项额度与整批预算必须为正整数"; return;
+  }
+
+  const btn = document.getElementById("submit");
+  btn.disabled = true; btn.textContent = "校验进行中…";
+  const r = await fetch("/api/batches", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ per_item_fuel: perItemFuel, total_budget: totalBudget, configs })
+  });
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    errEl.textContent = "提交失败：" + (d.detail || r.status);
+    stopPolling(); return;
+  }
+  const b = await r.json();
+  currentBatchId = b.id;
+  renderBatch(b);
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(poll, 400);
+  poll();
+};
+
+// 预置一套示例行
+addRow("prod-cn-east", 5000, 3000);
+addRow("staging-cn", 200000, 1500);
+addRow("dev-lab", 100, 90000);
+</script>
+</body>
+</html>

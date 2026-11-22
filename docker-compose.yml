@@ -1,0 +1,13 @@
+services:
+  validator:
+    build: .
+    image: proxy-wasm-validator:latest
+    container_name: proxy-wasm-validator
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/docs')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
