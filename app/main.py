@@ -61,6 +61,8 @@ def _serialize_batch(batch) -> dict:
         "max_parallel": 2,
         "items": [_serialize_item(i) for i in batch.items],
         "history": batch.history,
+        # 本进程实例池累计数据：实际新建、复用、淘汰等
+        "instances": app.state.validator.stats(),
     }
 
 
@@ -104,3 +106,9 @@ async def get_batch(batch_id: str) -> dict:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="批次不存在") from exc
     return _serialize_batch(batch)
+
+
+@app.get("/api/instances")
+async def get_instances() -> dict:
+    """本进程 Store/Instance 实例池累计统计（新建、复用、淘汰、在用/空闲）。"""
+    return app.state.validator.stats()

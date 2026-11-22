@@ -1,14 +1,18 @@
 """Wasmtime 运行封装。
 
-同一校验器模块在进程启动时只编译一次；每次校验新建独立 Store/Instance，
-各项从独立的初始状态开始，并以 fuel（指令额度）计量实际消耗。
+同一校验器模块在进程启动时只编译一次；校验执行复用空闲的 Store/Instance
+（进程内至多两套，每套同一时刻只借给一项校验），每次执行前把线性内存与
+导出的可变全局复位到新实例的初始值。以 fuel（指令额度）计量实际消耗；
+复位在设置燃料额度之前完成，不占用批次预算。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 
-from wasmtime import Config, Engine, Instance, Module, Store, Trap, TrapCode
+from wasmtime import Config, Engine, Module, Trap, TrapCode
+
+from .instance_pool import MAX_INSTANCES, InstancePool
 
 _WAT_PATH = Path(__file__).with_name("validator.wat")
 
@@ -33,39 +37,80 @@ class RunResult:
 
 
 class ValidatorEngine:
-    """持有唯一的已编译 Module，负责按项执行校验。"""
+    """持有唯一的已编译 Module 与实例池，负责按项执行校验。"""
 
-    def __init__(self) -> None:
+    def __init__(self, max_instances: int = MAX_INSTANCES) -> None:
         config = Config()
         config.consume_fuel = True
         self._engine = Engine(config)
         # 同一校验器只编译一次
         self._module = Module(self._engine, _WAT_PATH.read_text(encoding="utf-8"))
+        # 进程内至多保留 max_instances 套 Store + Instance，供各项轮流复用
+        self._pool = InstancePool(self._engine, self._module, max_instances)
+
+    @property
+    def pool(self) -> InstancePool:
+        return self._pool
+
+    def stats(self) -> dict:
+        """本进程实例池的累计新建/复用/淘汰次数等。"""
+        return self._pool.stats_snapshot()
 
     def run(self, conn_limit: int, timeout_ms: int, fuel_budget: int) -> RunResult:
-        # 每项从独立的初始状态开始（独立 Store + 独立 Instance）
-        store = Store(self._engine)
+        # 借出一套实例；一套同一时刻只供一项校验使用
+        slot, _created = self._pool.acquire()
+
+        # 每次执行前恢复到新实例的初始状态（不消耗燃料，先于设置额度）
+        try:
+            self._pool.reset(slot)
+        except Exception as exc:
+            self._pool.discard(slot, reset_failure=True)
+            error = f"实例复位失败，已淘汰：{exc}"
+            return RunResult(
+                verdict_code=-1,
+                verdict=f"未得出结论：{error}",
+                consumed=fuel_budget,  # 执行报错按全额预留结算
+                budget=fuel_budget,
+                out_of_fuel=False,
+                error=error,
+            )
+
+        store = slot.store
         store.set_fuel(fuel_budget)
-        instance = Instance(store, self._module, [])
-        exports = instance.exports(store)
-        validate = exports["validate"]
+        validate = slot.exports["validate"]
+        self._pool.record_run()
 
         out_of_fuel = False
         error: str | None = None
         verdict_code: int | None = None
+        evict = False
         try:
             verdict_code = int(validate(store, conn_limit, timeout_ms))
         except Trap as exc:
+            # 任何 Wasm 陷阱都说明实例状态不可信，淘汰后由后续项用干净实例
+            evict = True
             if exc.trap_code == TrapCode.OUT_OF_FUEL:
                 out_of_fuel = True
                 error = "指令额度耗尽，校验器在得出结论前被中断"
             else:
                 error = f"Wasm 陷阱：{exc}"
         except Exception as exc:  # pragma: no cover - 防御性兜底
+            evict = True
             error = f"校验器执行异常：{exc}"
 
-        remaining = store.get_fuel()
-        consumed = fuel_budget - remaining
+        try:
+            remaining = store.get_fuel()
+            consumed = max(0, fuel_budget - remaining)
+        except Exception as exc:  # pragma: no cover - 防御性兜底
+            evict = True
+            consumed = fuel_budget
+            error = error or f"读取剩余燃料失败：{exc}"
+
+        if evict:
+            self._pool.discard(slot)
+        else:
+            # 执行正常：内存/全局即使已被写脏，下次借出前也会复位
+            self._pool.release(slot)
 
         if out_of_fuel:
             verdict = "未得出结论：指令额度不足（OUT_OF_FUEL）"

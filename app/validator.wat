@@ -7,6 +7,7 @@
 ;;   checksum() -> i64            读取最近一次校验写入的状态指纹
 ;;   get_state() -> i64           读取可变全局（证明每项独立初始状态）
 ;;   bump_state() -> i64          自增可变全局并返回新值
+;;   check_count (global)         可变全局的导出名，实例池据此复位
 ;;   memory: 1 页，保存最近一次校验的输入与结论
 ;;
 ;; 每次校验包含一段固定工作量的循环，使不同结论的指令消耗可观测。
@@ -21,8 +22,9 @@
 
   (memory (export "memory") 1)
 
-  ;; 可变状态：每次实例化都从 0 开始，随校验次数累加
-  (global $check_count (mut i64) (i64.const 0))
+  ;; 可变状态：每次实例化都从 0 开始，随校验次数累加。
+  ;; 导出该可变全局，实例池在每次复用前按此处的初始值复位。
+  (global $check_count (export "check_count") (mut i64) (i64.const 0))
 
   (func (export "checksum") (result i64)
     (i64.load (i32.const 8)))

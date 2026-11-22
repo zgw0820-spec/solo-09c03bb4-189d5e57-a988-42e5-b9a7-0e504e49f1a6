@@ -64,9 +64,9 @@
 <div class="wrap">
   <h1>代理换版 · 环境连接上限 / 请求超时 Wasm 校验</h1>
   <div class="sub">
-    Wasmtime 运行内置 Wasm 校验器（模块只编译一次，每项独立初始状态）；
-    最多并行 <b>2</b> 项，启动前预留足额单项指令额度，结束后按实际消耗结算、退回未用额度；
-    预算不足时剩余配置标记为“未检”。
+    Wasmtime 运行内置 Wasm 校验器（模块只编译一次；至多两套 Store/Instance
+    轮流复用，每次执行前复位内存与可变全局）；最多并行 <b>2</b> 项，启动前预留
+    足额单项指令额度，结束后按实际消耗结算、退回未用额度；预算不足时剩余配置标记为“未检”。
   </div>
 
   <div class="panel">
@@ -102,6 +102,7 @@
   <div class="panel" id="result-panel" style="display:none">
     <h2>② 校验进度与逐项结论</h2>
     <div class="stat" id="batch-stat"></div>
+    <div class="stat muted" id="pool-stat" style="font-size:12px"></div>
     <table>
       <thead>
         <tr>
@@ -161,6 +162,18 @@ function renderBatch(b) {
     <span class="muted">排队 ${counts.queued || 0} · 校验中 ${counts.running || 0} ·
       通过 ${counts.passed || 0} · 不通过 ${counts.failed || 0} ·
       未结论 ${counts.no_conclusion || 0} · 未检 ${counts.skipped || 0}</span>`;
+
+  if (b.instances) {
+    const s = b.instances;
+    document.getElementById("pool-stat").innerHTML = `
+      <span>实例上限 <b>${s.max_instances}</b></span>
+      <span>本进程实际新建 <b id="pool-created">${s.created}</b></span>
+      <span>复用次数 <b id="pool-reused">${s.reused}</b></span>
+      <span>淘汰 <b>${s.evicted}</b>${s.reset_failures ? `（复位失败 ${s.reset_failures}）` : ""}</span>
+      <span>复位次数 <b>${s.resets}</b></span>
+      <span>当前在用/空闲 <b>${s.in_use}/${s.idle}</b></span>
+      <span>历史最大在用 <b>${s.max_in_use}</b></span>`;
+  }
 
   document.getElementById("result-body").innerHTML = b.items.map(i => `
     <tr>

@@ -62,10 +62,46 @@ def test_api_with_lifespan():
                     final["settled_consumed"] + final["remaining_budget"]
                 )
                 assert final["reserved"] == 0
+                # 本进程只用两套以内的 Store/Instance，其余校验均复用
+                inst = final["instances"]
+                assert inst["max_instances"] == 2
+                assert inst["created"] <= 2
+                assert inst["created"] + inst["reused"] == inst["runs"] == 4
+                assert inst["in_use"] == 0
 
                 page = await client.get("/")
                 assert page.status_code == 200
                 assert "Wasm".encode() in page.content
+                assert "实例".encode() in page.content
+
+                standalone = await client.get("/api/instances")
+                assert standalone.status_code == 200
+                assert standalone.json()["created"] == inst["created"]
+
+    asyncio.run(scenario())
+
+
+def test_api_parallel_reuse_across_many_items():
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://t"
+            ) as client:
+                # 20 项串行/并行混合执行；进程只新建至多 2 套实例并反复复用
+                body = await _post_batch(client, _payload(20, 300_000, 20_000_000))
+                final = await _wait_done(client, body["id"], timeout=20)
+                assert all(i["status"] == "passed" for i in final["items"])
+                inst = final["instances"]
+                # 进程内至多两套；首发两项可能并发新建，也可能因先后完成而只新建一套
+                assert 1 <= inst["created"] <= 2
+                assert inst["reused"] >= 18
+                assert inst["created"] + inst["reused"] == inst["runs"] == 20
+                assert inst["evicted"] == 0
+                # 复位开销不进入批次账本：账本仍严格守恒
+                assert final["total_budget"] == (
+                    final["settled_consumed"] + final["remaining_budget"]
+                )
 
     asyncio.run(scenario())
 
@@ -134,6 +170,33 @@ def test_api_out_of_fuel_item_is_no_conclusion_but_settled():
                 # 报错/耗尽也照结算：3 * 500 全部扣减
                 assert final["settled_consumed"] == 1500
                 assert final["remaining_budget"] == 10_000 - 1500
+                # 每项陷阱都会淘汰实例；后续项用干净实例继续，全部得出结论
+                inst = final["instances"]
+                assert inst["evicted"] == 3
+                assert inst["created"] + inst["reused"] == inst["runs"] == 3
+
+    asyncio.run(scenario())
+
+
+def test_api_trap_evicts_then_clean_instance_continues():
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://t"
+            ) as client:
+                # 先耗尽：实例被淘汰；再提交正常批量，用干净实例继续校验
+                first = await _post_batch(client, _payload(2, 500, 10_000))
+                await _wait_done(client, first["id"])
+                st1 = (await client.get("/api/instances")).json()
+                assert st1["evicted"] == 2
+
+                second = await _post_batch(client, _payload(2, 300_000, 1_000_000))
+                final = await _wait_done(client, second["id"])
+                assert all(i["status"] == "passed" for i in final["items"])
+                st2 = final["instances"]
+                assert st2["evicted"] == 2
+                assert st2["created"] + st2["reused"] == st2["runs"] == 4
 
     asyncio.run(scenario())
 
